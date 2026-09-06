@@ -1,0 +1,679 @@
+Binary files falling-detect-orig/__pycache__/config.cpython-313.pyc and falling-detect-work/__pycache__/config.cpython-313.pyc differ
+Binary files falling-detect-orig/__pycache__/fall_detector.cpython-313.pyc and falling-detect-work/__pycache__/fall_detector.cpython-313.pyc differ
+Binary files falling-detect-orig/__pycache__/fall_logic.cpython-313.pyc and falling-detect-work/__pycache__/fall_logic.cpython-313.pyc differ
+diff -ruN falling-detect-orig/config.py falling-detect-work/config.py
+--- falling-detect-orig/config.py	2026-09-06 09:03:46.882658211 +0000
++++ falling-detect-work/config.py	2026-09-06 09:04:51.858662543 +0000
+@@ -29,14 +29,17 @@
+ # จะถือว่าร่างกายอยู่ในลักษณะแนวนอน
+ FALL_RATIO = 1.2
+ 
+-# ต้องตรวจพบล้มต่อเนื่องกี่เฟรม
+-FALL_FRAMES = 15
++# ต้องลดระดับลงอย่างรวดเร็วอย่างน้อยกี่เท่าของความสูงร่างกาย
++FALL_DROP_RATIO = 0.35
+ 
++# ความเร็วการลดระดับขั้นต่ำ (body-heights / second)
++FALL_SPEED_RATIO = 0.55
+ 
+-# -----------------------------
+-# Alert
+-# -----------------------------
++# การเปลี่ยนจากยืนเป็นแนวนอนต้องเกิดภายในกี่วินาที
++FALL_TRANSITION_WINDOW = 1.0
+ 
+-# เวลาระหว่างการแจ้งเตือนแต่ละครั้ง
+-# หน่วยเป็นวินาที
+-ALERT_COOLDOWN = 10
++# ต้องคงท่าแนวนอนกี่วินาทีหลัง rapid descent จึงยืนยันการล้ม
++FALL_HORIZONTAL_CONFIRM_TIME = 0.20
++
++# ต้องกลับมาไม่เป็นแนวนอนต่อเนื่องกี่วินาทีจึง reset event
++FALL_RECOVERY_TIME = 0.50
+diff -ruN falling-detect-orig/fall_detector.py falling-detect-work/fall_detector.py
+--- falling-detect-orig/fall_detector.py	2026-09-06 09:03:46.883538298 +0000
++++ falling-detect-work/fall_detector.py	2026-09-06 09:05:22.061559073 +0000
+@@ -1,6 +1,6 @@
+ # ==========================================
+ # fall_detector.py
+-# YOLO Pose + Fall Detection
++# YOLO Pose + Temporal Fall Detection
+ # ==========================================
+ 
+ import cv2
+@@ -11,9 +11,13 @@
+ from config import (
+     CONFIDENCE,
+     FALL_RATIO,
+-    FALL_FRAMES,
+-    ALERT_COOLDOWN
++    FALL_DROP_RATIO,
++    FALL_SPEED_RATIO,
++    FALL_TRANSITION_WINDOW,
++    FALL_HORIZONTAL_CONFIRM_TIME,
++    FALL_RECOVERY_TIME,
+ )
++from fall_logic import FallTemporalClassifier
+ 
+ 
+ class FallDetector:
+@@ -22,232 +26,130 @@
+ 
+         print("กำลังโหลด YOLO Pose...")
+ 
+-        # โหลดโมเดล YOLO Pose
+         self.model = YOLO("yolo11n-pose.pt")
+ 
+         print("โหลด YOLO Pose สำเร็จ")
+ 
+-        # จำนวนเฟรมที่ตรวจพบว่าคนอยู่ในลักษณะล้ม
+-        self.fall_counter = 0
+-
+-        # เวลาที่แจ้งเตือนล่าสุด
+-        self.last_alert_time = 0
++        self.classifier = FallTemporalClassifier(
++            rapid_drop_ratio=FALL_DROP_RATIO,
++            rapid_speed_ratio=FALL_SPEED_RATIO,
++            transition_window=FALL_TRANSITION_WINDOW,
++            horizontal_confirm_time=FALL_HORIZONTAL_CONFIRM_TIME,
++            recovery_time=FALL_RECOVERY_TIME,
++        )
+ 
+-        # สถานะการล้ม
+         self.fall_detected = False
+ 
+ 
+     def detect(self, frame):
+ 
+-        # ส่งภาพเข้า YOLO
+         results = self.model(
+             frame,
+             conf=CONFIDENCE,
+             verbose=False
+         )
+ 
+-        # สถานะว่าตอนนี้มีคนอยู่ในท่าที่สงสัยว่าล้มหรือไม่
+-        fall_now = False
++        poses = []
+ 
+-
+-        # วนดูผลลัพธ์
+         for result in results:
+ 
+-            # ไม่มี Keypoints
+             if result.keypoints is None:
+                 continue
+ 
+-
+-            # จุด Pose ทั้งหมด
+             keypoints = result.keypoints.xy
+ 
+-
+-            # ตรวจคนแต่ละคน
+-            for i in range(len(keypoints)):
+-
+-                points = keypoints[i]
+-
+-
+-                # --------------------------------------
+-                # หาจุดของร่างกายทั้งหมด
+-                # --------------------------------------
++            for points in keypoints:
+ 
+                 x_points = []
+                 y_points = []
+ 
+-
+                 for point in points:
+-
+                     x = float(point[0])
+                     y = float(point[1])
+ 
+-
+-                    # ข้ามจุดที่ไม่มีข้อมูล
+                     if x > 0 and y > 0:
+-
+                         x_points.append(x)
+                         y_points.append(y)
+ 
+-
+-                # ต้องมีจุดร่างกายอย่างน้อย 5 จุด
+                 if len(x_points) < 5:
+-
+                     continue
+ 
+-
+-                # --------------------------------------
+-                # หาขอบเขตร่างกาย
+-                # --------------------------------------
+-
+                 min_x = min(x_points)
+                 max_x = max(x_points)
+-
+                 min_y = min(y_points)
+                 max_y = max(y_points)
+ 
+-
+                 width = max_x - min_x
+                 height = max_y - min_y
+ 
+-
+                 if height <= 0:
+-
+                     continue
+ 
+-
+-                # --------------------------------------
+-                # คำนวณอัตราส่วน
+-                # --------------------------------------
+-
+                 ratio = width / height
+-
+-
+-                # --------------------------------------
+-                # ตรวจสอบว่าร่างกายเป็นแนวนอนหรือไม่
+-                # --------------------------------------
+-
+                 horizontal = ratio > FALL_RATIO
++                center_y = (min_y + max_y) / 2
++                area = width * height
+ 
+-
+-                # --------------------------------------
+-                # กรณีสงสัยว่าล้ม
+-                # --------------------------------------
+-
+-                if horizontal:
+-
+-                    fall_now = True
+-
+-
+-                    x1 = int(min_x)
+-                    y1 = int(min_y)
+-
+-                    x2 = int(max_x)
+-                    y2 = int(max_y)
+-
+-
+-                    # กรอบสีแดง
+-                    cv2.rectangle(
+-                        frame,
+-                        (x1, y1),
+-                        (x2, y2),
+-                        (0, 0, 255),
+-                        3
+-                    )
+-
+-
+-                    # ข้อความ FALL?
+-                    cv2.putText(
+-                        frame,
+-                        "FALL?",
+-                        (x1, max(30, y1 - 10)),
+-                        cv2.FONT_HERSHEY_SIMPLEX,
+-                        1,
+-                        (0, 0, 255),
+-                        3
+-                    )
+-
+-
+-                # --------------------------------------
+-                # กรณีปกติ
+-                # --------------------------------------
+-
+-                else:
+-
+-                    x1 = int(min_x)
+-                    y1 = int(min_y)
+-
+-                    x2 = int(max_x)
+-                    y2 = int(max_y)
+-
+-
+-                    # กรอบสีเขียว
+-                    cv2.rectangle(
+-                        frame,
+-                        (x1, y1),
+-                        (x2, y2),
+-                        (0, 255, 0),
+-                        2
+-                    )
+-
+-
+-        # ==========================================
+-        # นับจำนวนเฟรม
+-        # ==========================================
+-
+-        if fall_now:
+-
+-            self.fall_counter += 1
+-
+-        else:
+-
+-            # ถ้าไม่พบการล้ม
+-            # ลด counter ลงแทนที่จะรีเซ็ตทันที
+-            self.fall_counter = max(
+-                0,
+-                self.fall_counter - 2
++                poses.append({
++                    "min_x": min_x,
++                    "max_x": max_x,
++                    "min_y": min_y,
++                    "max_y": max_y,
++                    "height": height,
++                    "center_y": center_y,
++                    "horizontal": horizontal,
++                    "area": area,
++                })
++
++        # PR 1 keeps detection single-subject: the largest visible pose is the
++        # primary subject. Stable multi-person tracking remains out of scope.
++        primary_pose = max(poses, key=lambda pose: pose["area"], default=None)
++
++        event_detected = False
++
++        if primary_pose is not None:
++            event_detected = self.classifier.update(
++                timestamp=time.monotonic(),
++                center_y=primary_pose["center_y"],
++                body_height=primary_pose["height"],
++                horizontal=primary_pose["horizontal"],
+             )
+-
+-
+-        # ==========================================
+-        # ยืนยันการล้ม
+-        # ==========================================
+-
+-        if self.fall_counter >= FALL_FRAMES:
+-
+-            self.fall_detected = True
+-
++            self.fall_detected = self.classifier.active
+         else:
++            self.fall_detected = self.classifier.active
+ 
+-            self.fall_detected = False
+-
+-
+-        # ==========================================
+-        # แจ้งเตือน
+-        # ==========================================
+-
+-        if self.fall_detected:
+-
+-            current_time = time.time()
+-
+-
+-            # ป้องกันแจ้งเตือนซ้ำรัว ๆ
+-            if (
+-                current_time - self.last_alert_time
+-                > ALERT_COOLDOWN
+-            ):
+-
+-                self.alert()
+-
+-                self.last_alert_time = current_time
++        for pose in poses:
++            x1 = int(pose["min_x"])
++            y1 = int(pose["min_y"])
++            x2 = int(pose["max_x"])
++            y2 = int(pose["max_y"])
++
++            is_primary = pose is primary_pose
++            suspicious = is_primary and pose["horizontal"]
++
++            color = (0, 0, 255) if suspicious else (0, 255, 0)
++            thickness = 3 if suspicious else 2
++
++            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
++
++            if suspicious:
++                label = "FALL" if self.fall_detected else "HORIZONTAL"
++                cv2.putText(
++                    frame,
++                    label,
++                    (x1, max(30, y1 - 10)),
++                    cv2.FONT_HERSHEY_SIMPLEX,
++                    1,
++                    color,
++                    3,
++                )
+ 
++        if event_detected:
++            self.alert()
+ 
+         return frame
+ 
+ 
+-    # ==========================================
+-    # ฟังก์ชันแจ้งเตือน
+-    # ==========================================
+-
+     def alert(self):
+ 
+         print()
+diff -ruN falling-detect-orig/fall_logic.py falling-detect-work/fall_logic.py
+--- falling-detect-orig/fall_logic.py	1970-01-01 00:00:00.000000000 +0000
++++ falling-detect-work/fall_logic.py	2026-09-06 09:02:13.121706824 +0000
+@@ -0,0 +1,113 @@
++from collections import deque
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class PoseObservation:
++    timestamp: float
++    center_y: float
++    body_height: float
++    horizontal: bool
++
++
++class FallTemporalClassifier:
++    def __init__(
++        self,
++        rapid_drop_ratio,
++        rapid_speed_ratio,
++        transition_window,
++        horizontal_confirm_time,
++        recovery_time,
++    ):
++        self.rapid_drop_ratio = rapid_drop_ratio
++        self.rapid_speed_ratio = rapid_speed_ratio
++        self.transition_window = transition_window
++        self.horizontal_confirm_time = horizontal_confirm_time
++        self.recovery_time = recovery_time
++
++        self.history = deque()
++        self.horizontal_since = None
++        self.rapid_transition_seen = False
++        self.recovery_since = None
++        self.active = False
++
++    def update(self, *, timestamp, center_y, body_height, horizontal):
++        observation = PoseObservation(
++            timestamp=timestamp,
++            center_y=center_y,
++            body_height=max(body_height, 1e-6),
++            horizontal=horizontal,
++        )
++        self.history.append(observation)
++        self._trim_history(timestamp)
++
++        if self.active:
++            self._update_recovery(timestamp, horizontal)
++            return False
++
++        if not horizontal:
++            self.horizontal_since = None
++            self.rapid_transition_seen = False
++            return False
++
++        if self.horizontal_since is None:
++            self.horizontal_since = timestamp
++
++        self.rapid_transition_seen = (
++            self.rapid_transition_seen
++            or self._has_rapid_descent(observation)
++        )
++
++        if (
++            self.rapid_transition_seen
++            and timestamp - self.horizontal_since >= self.horizontal_confirm_time
++        ):
++            self.active = True
++            self.recovery_since = None
++            return True
++
++        return False
++
++    def _trim_history(self, timestamp):
++        keep_after = timestamp - self.transition_window
++        while self.history and self.history[0].timestamp < keep_after:
++            self.history.popleft()
++
++    def _has_rapid_descent(self, current):
++        upright_samples = [
++            sample
++            for sample in self.history
++            if not sample.horizontal and sample.timestamp < current.timestamp
++        ]
++        if not upright_samples:
++            return False
++
++        baseline = upright_samples[0]
++        elapsed = current.timestamp - baseline.timestamp
++        if elapsed <= 0 or elapsed > self.transition_window:
++            return False
++
++        drop = current.center_y - baseline.center_y
++        drop_ratio = drop / baseline.body_height
++        speed_ratio = drop_ratio / elapsed
++
++        return (
++            drop_ratio >= self.rapid_drop_ratio
++            and speed_ratio >= self.rapid_speed_ratio
++        )
++
++    def _update_recovery(self, timestamp, horizontal):
++        if horizontal:
++            self.recovery_since = None
++            return
++
++        if self.recovery_since is None:
++            self.recovery_since = timestamp
++            return
++
++        if timestamp - self.recovery_since >= self.recovery_time:
++            self.active = False
++            self.horizontal_since = None
++            self.rapid_transition_seen = False
++            self.recovery_since = None
++            self.history.clear()
+Binary files falling-detect-orig/tests/__pycache__/test_fall_detector.cpython-313.pyc and falling-detect-work/tests/__pycache__/test_fall_detector.cpython-313.pyc differ
+Binary files falling-detect-orig/tests/__pycache__/test_fall_logic.cpython-313.pyc and falling-detect-work/tests/__pycache__/test_fall_logic.cpython-313.pyc differ
+diff -ruN falling-detect-orig/tests/test_fall_detector.py falling-detect-work/tests/test_fall_detector.py
+--- falling-detect-orig/tests/test_fall_detector.py	1970-01-01 00:00:00.000000000 +0000
++++ falling-detect-work/tests/test_fall_detector.py	2026-09-06 09:05:22.061680812 +0000
+@@ -0,0 +1,100 @@
++import sys
++import types
++import unittest
++from unittest.mock import patch
++
++
++if "ultralytics" not in sys.modules:
++    fake_ultralytics = types.ModuleType("ultralytics")
++    fake_ultralytics.YOLO = object
++    sys.modules["ultralytics"] = fake_ultralytics
++
++import fall_detector
++
++
++class FakeKeypoints:
++    def __init__(self, people):
++        self.xy = people
++
++
++class FakeResult:
++    def __init__(self, people):
++        self.keypoints = FakeKeypoints(people)
++
++
++class FakeModel:
++    def __init__(self, frames):
++        self.frames = iter(frames)
++
++    def __call__(self, frame, conf, verbose):
++        return [FakeResult(next(self.frames))]
++
++
++def pose(center_y, width, height):
++    min_x = 100.0
++    max_x = min_x + width
++    min_y = center_y - height / 2
++    max_y = center_y + height / 2
++    points = [
++        (min_x, min_y),
++        (max_x, min_y),
++        (min_x, max_y),
++        (max_x, max_y),
++        ((min_x + max_x) / 2, center_y),
++    ]
++    return points + [points[-1]] * 12
++
++
++class FallDetectorIntegrationTests(unittest.TestCase):
++    def build_detector(self, samples):
++        frames = [[pose(center_y, width, height)] for _, center_y, width, height in samples]
++        model = FakeModel(frames)
++        with patch.object(fall_detector, "YOLO", return_value=model):
++            detector = fall_detector.FallDetector()
++        detector.alert_count = 0
++        detector.alert = lambda: setattr(detector, "alert_count", detector.alert_count + 1)
++        return detector
++
++    def run_samples(self, samples):
++        detector = self.build_detector(samples)
++        timestamps = [sample[0] for sample in samples]
++        with (
++            patch.object(fall_detector.time, "monotonic", side_effect=timestamps),
++            patch.object(fall_detector.cv2, "rectangle", return_value=None),
++            patch.object(fall_detector.cv2, "putText", return_value=None),
++        ):
++            for _ in samples:
++                detector.detect(object())
++        return detector
++
++    def test_rapid_drop_then_horizontal_alerts_once(self):
++        detector = self.run_samples([
++            (0.00, 100, 50, 100),
++            (0.20, 105, 50, 100),
++            (0.40, 125, 55, 90),
++            (0.55, 145, 100, 50),
++            (0.80, 148, 100, 50),
++            (1.20, 148, 100, 50),
++            (1.60, 148, 100, 50),
++        ])
++        self.assertEqual(detector.alert_count, 1)
++        self.assertTrue(detector.fall_detected)
++
++    def test_slow_lie_down_does_not_alert_even_when_horizontal_persists(self):
++        samples = [
++            (0.00, 100, 50, 100),
++            (0.50, 105, 50, 100),
++            (1.00, 110, 50, 100),
++            (1.50, 115, 55, 90),
++        ]
++        samples.extend(
++            (2.00 + index * 0.10, 120, 100, 50)
++            for index in range(20)
++        )
++        detector = self.run_samples(samples)
++        self.assertEqual(detector.alert_count, 0)
++        self.assertFalse(detector.fall_detected)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff -ruN falling-detect-orig/tests/test_fall_logic.py falling-detect-work/tests/test_fall_logic.py
+--- falling-detect-orig/tests/test_fall_logic.py	1970-01-01 00:00:00.000000000 +0000
++++ falling-detect-work/tests/test_fall_logic.py	2026-09-06 09:01:30.516714366 +0000
+@@ -0,0 +1,97 @@
++import unittest
++
++from fall_logic import FallTemporalClassifier
++
++
++class FallTemporalClassifierTests(unittest.TestCase):
++    def setUp(self):
++        self.detector = FallTemporalClassifier(
++            rapid_drop_ratio=0.35,
++            rapid_speed_ratio=0.55,
++            transition_window=1.0,
++            horizontal_confirm_time=0.20,
++            recovery_time=0.50,
++        )
++
++    def feed(self, samples):
++        result = False
++        for timestamp, center_y, body_height, horizontal in samples:
++            result = self.detector.update(
++                timestamp=timestamp,
++                center_y=center_y,
++                body_height=body_height,
++                horizontal=horizontal,
++            )
++        return result
++
++    def test_rapid_descent_to_horizontal_is_fall(self):
++        detected = self.feed([
++            (0.00, 0.30, 0.50, False),
++            (0.20, 0.34, 0.49, False),
++            (0.40, 0.44, 0.44, False),
++            (0.55, 0.54, 0.34, True),
++            (0.80, 0.56, 0.31, True),
++        ])
++        self.assertTrue(detected)
++
++    def test_slowly_lying_down_is_not_fall(self):
++        detected = self.feed([
++            (0.00, 0.30, 0.50, False),
++            (0.50, 0.34, 0.48, False),
++            (1.00, 0.39, 0.44, False),
++            (1.50, 0.44, 0.40, False),
++            (2.00, 0.49, 0.35, True),
++            (2.30, 0.51, 0.32, True),
++        ])
++        self.assertFalse(detected)
++
++    def test_already_lying_is_not_fall(self):
++        detected = self.feed([
++            (0.00, 0.55, 0.31, True),
++            (0.30, 0.55, 0.31, True),
++            (0.60, 0.56, 0.30, True),
++            (0.90, 0.55, 0.31, True),
++        ])
++        self.assertFalse(detected)
++
++    def test_alert_is_latched_until_recovery(self):
++        first = self.feed([
++            (0.00, 0.30, 0.50, False),
++            (0.30, 0.40, 0.46, False),
++            (0.50, 0.55, 0.32, True),
++            (0.75, 0.56, 0.31, True),
++        ])
++        still_lying = self.detector.update(
++            timestamp=2.00,
++            center_y=0.56,
++            body_height=0.31,
++            horizontal=True,
++        )
++        self.assertTrue(first)
++        self.assertFalse(still_lying)
++
++        self.detector.update(
++            timestamp=2.20,
++            center_y=0.35,
++            body_height=0.49,
++            horizontal=False,
++        )
++        recovered = self.detector.update(
++            timestamp=2.80,
++            center_y=0.34,
++            body_height=0.50,
++            horizontal=False,
++        )
++        self.assertFalse(recovered)
++
++        second = self.feed([
++            (3.00, 0.34, 0.50, False),
++            (3.20, 0.42, 0.45, False),
++            (3.40, 0.55, 0.32, True),
++            (3.65, 0.56, 0.31, True),
++        ])
++        self.assertTrue(second)
++
++
++if __name__ == "__main__":
++    unittest.main()
